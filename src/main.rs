@@ -89,7 +89,7 @@ impl State {
         self.configure_surface();
     }
 
-    fn render(&mut self, acquire: bool) {
+    fn render(&mut self) {
         if self.surface_texture.is_none() {
             self.update_surface_texture();
         }
@@ -138,10 +138,6 @@ impl State {
         self.window.pre_present_notify();
 
         self.queue.present(surface_texture);
-
-        if acquire {
-            self.update_surface_texture();
-        }
     }
 
     fn update_surface_texture(&mut self) {
@@ -184,7 +180,8 @@ struct App {
 impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let state = self.state.as_mut().unwrap();
-        state.render(true);
+        state.render();
+        state.update_surface_texture();
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -214,7 +211,7 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                state.render(false);
+                state.render();
             }
             WindowEvent::Resized(size) => {
                 // Reconfigures the size of the surface. We do not re-render
