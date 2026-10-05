@@ -16,14 +16,28 @@ struct State {
     size: winit::dpi::PhysicalSize<u32>,
     surface: wgpu::Surface<'static>,
     surface_format: wgpu::TextureFormat,
-    surface_texture: Option<SurfaceTexture>
+    surface_texture: Option<SurfaceTexture>,
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
+    clear_color: [f32; 3],
+    counter: u32,
 }
 
 impl State {
     async fn new(display: OwnedDisplayHandle, window: Arc<Window>) -> State {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            flags: wgpu::InstanceFlags::advanced_debugging(),
+            backend_options: wgpu::BackendOptions {
+                dx12: wgpu::Dx12BackendOptions {
+                    latency_waitable_object: wgpu::Dx12UseFrameLatencyWaitableObject::Wait,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..wgpu::InstanceDescriptor::new_with_display_handle(
             Box::new(display),
-        ));
+        )});
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await
@@ -39,6 +53,22 @@ impl State {
         let cap = surface.get_capabilities(&adapter);
         let surface_format = cap.formats[0];
 
+        // egui expects to render into a gamma-space (non-sRGB) target.
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            surface_format.remove_srgb_suffix(),
+            egui_wgpu::RendererOptions::default(),
+        );
+        let egui_ctx = egui::Context::default();
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            window.as_ref(),
+            Some(window.scale_factor() as f32),
+            window.theme(),
+            Some(device.limits().max_texture_dimension_2d as usize),
+        );
+
         let mut state = State {
             instance,
             window,
@@ -47,7 +77,12 @@ impl State {
             size,
             surface,
             surface_format,
-            surface_texture: None
+            surface_texture: None,
+            egui_ctx,
+            egui_state,
+            egui_renderer,
+            clear_color: [0.0, 1.0, 0.0],
+            counter: 0,
         };
 
         // Configure surface for the first time
@@ -62,6 +97,7 @@ impl State {
 
     fn configure_surface(&mut self) {
         if self.surface_texture.is_some() {
+            self.queue.present(std::mem::take(&mut self.surface_texture).unwrap());
             println!("dropit");
         }
 
@@ -71,8 +107,8 @@ impl State {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: self.surface_format,
             color_space: wgpu::SurfaceColorSpace::Auto,
-            // Request compatibility with the sRGB-format texture view we‘re going to create later.
-            view_formats: vec![self.surface_format.add_srgb_suffix()],
+            // Request compatibility with the non-sRGB texture view we're going to create later.
+            view_formats: vec![self.surface_format.remove_srgb_suffix()],
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             width: self.size.width,
             height: self.size.height,
@@ -100,41 +136,88 @@ impl State {
         let texture_view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor {
-                // Without add_srgb_suffix() the image we will be working with
-                // might not be "gamma correct".
-                format: Some(self.surface_format.add_srgb_suffix()),
+                // egui wants to render in gamma space, so view the surface
+                // without the sRGB suffix.
+                format: Some(self.surface_format.remove_srgb_suffix()),
                 ..Default::default()
             });
 
-        // Renders a GREEN screen
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        // Create the renderpass which will clear the screen.
-        let renderpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: None,
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &texture_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::GREEN),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
+        // Run the GUI for this frame.
+        let raw_input = self.egui_state.take_egui_input(&self.window);
+        let mut full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+            egui::Window::new("Hello egui").show(ui.ctx(), |ui| {
+                ui.label("Hello from egui-wgpu!");
+                ui.horizontal(|ui| {
+                    ui.label("Background:");
+                    ui.color_edit_button_rgb(&mut self.clear_color);
+                });
+                if ui.button("Click me").clicked() {
+                    self.counter += 1;
+                }
+                ui.label(format!("Clicked {} times", self.counter));
+            });
         });
+        self.egui_state
+            .handle_platform_output(&self.window, full_output.platform_output);
 
-        // If you wanted to call any drawing commands, they would go here.
+        let paint_jobs = self
+            .egui_ctx
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.size.width, self.size.height],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+
+        for (id, image_deltas) in full_output.textures_delta.set.drain() {
+            for image_delta in image_deltas {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, id, &image_delta);
+            }
+        }
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let user_cmd_bufs = self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+
+        // Create the renderpass which will clear the screen and draw the GUI.
+        let [r, g, b] = self.clear_color.map(f64::from);
+        let mut renderpass = encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &texture_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            })
+            .forget_lifetime();
+
+        self.egui_renderer
+            .render(&mut renderpass, &paint_jobs, &screen_descriptor);
 
         // End the renderpass.
         drop(renderpass);
 
-        //encoder.clear_texture(&surface_texture.texture, &wgpu::ImageSubresourceRange);
-
         // Submit the command in the queue to execute
-        self.queue.submit([encoder.finish()]);
+        self.queue
+            .submit(user_cmd_bufs.into_iter().chain([encoder.finish()]));
+
+        for id in full_output.textures_delta.free.drain() {
+            self.egui_renderer.free_texture(&id);
+        }
         self.window.pre_present_notify();
 
         self.queue.present(surface_texture);
@@ -157,7 +240,11 @@ impl State {
                     break;
                 },
                 wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => return,
-                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
+                wgpu::CurrentSurfaceTexture::Outdated => {
+                    self.configure_surface();
+                }
+                wgpu::CurrentSurfaceTexture::Suboptimal(tex) => {
+                    panic!("here");
                     self.configure_surface();
                 }
                 wgpu::CurrentSurfaceTexture::Validation => {
@@ -205,6 +292,14 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let state = self.state.as_mut().unwrap();
+
+        // Let egui see the event first. We still handle close/resize/redraw
+        // ourselves regardless of whether egui consumed it.
+        let response = state.egui_state.on_window_event(&state.window, &event);
+        if response.repaint {
+            state.window.request_redraw();
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 println!("The close button was pressed; stopping");
