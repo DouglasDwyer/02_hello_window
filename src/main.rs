@@ -8,6 +8,64 @@ use winit::{
     window::{Window, WindowId},
 };
 
+/// Height/width of the fixed square, and height of the proportional bar.
+const SQUARE_SIZE: u32 = 50;
+/// Top-left corner (x, y), in pixels, of the fixed square and of the proportional bar.
+const SQUARE_POS: [u32; 2] = [400, 200];
+const BAR_POS: [u32; 2] = [100, 300];
+
+/// Width of the source texture; caps the width of the proportional bar.
+const SQUARE_TEXTURE_WIDTH: u32 = 8192;
+
+/// Creates a source texture for the test squares and fills it with solid colours.
+fn create_square_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+) -> wgpu::Texture {
+    let extent = wgpu::Extent3d {
+        width: SQUARE_TEXTURE_WIDTH.min(device.limits().max_texture_dimension_2d),
+        height: SQUARE_SIZE * 2,
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("square_texture"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    // Raw bytes are copied, so the channel order has to match the surface format.
+    let pixel = |[r, g, b]: [u8; 3]| match format.remove_srgb_suffix() {
+        wgpu::TextureFormat::Bgra8Unorm => [b, g, r, 255],
+        wgpu::TextureFormat::Rgba8Unorm => [r, g, b, 255],
+        other => panic!("unsupported surface format {other:?}"),
+    };
+    let mut data = Vec::new();
+    for (row, color) in [(0..SQUARE_SIZE, [255, 0, 0]), (SQUARE_SIZE..SQUARE_SIZE * 2, [0, 0, 255])] {
+        for _ in row {
+            for _ in 0..extent.width {
+                data.extend_from_slice(&pixel(color));
+            }
+        }
+    }
+    queue.write_texture(
+        texture.as_image_copy(),
+        &data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(extent.width * 4),
+            rows_per_image: Some(extent.height),
+        },
+        extent,
+    );
+    texture
+}
+
 struct State {
     instance: wgpu::Instance,
     window: Arc<Window>,
@@ -16,14 +74,28 @@ struct State {
     size: winit::dpi::PhysicalSize<u32>,
     surface: wgpu::Surface<'static>,
     surface_format: wgpu::TextureFormat,
-    surface_texture: Option<SurfaceTexture>
+    surface_texture: Option<SurfaceTexture>,
+    /// Pre-filled texture (same format as the surface) that the test squares are copied from.
+    /// Rows `0..SQUARE_SIZE` hold the fixed-size square's colour, the next `SQUARE_SIZE` rows
+    /// hold the proportional bar's colour.
+    square_texture: wgpu::Texture
 }
 
 impl State {
     async fn new(display: OwnedDisplayHandle, window: Arc<Window>) -> State {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
-            Box::new(display),
-        ));
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backend_options: wgpu::BackendOptions {
+                dx12: wgpu::Dx12BackendOptions {
+                    // Important: smooth resizing does not work without this
+                    presentation_system: wgpu::Dx12SwapchainKind::DxgiFromVisual,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..wgpu::InstanceDescriptor::new_with_display_handle(
+                Box::new(display),
+            )
+        });
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await
@@ -39,6 +111,8 @@ impl State {
         let cap = surface.get_capabilities(&adapter);
         let surface_format = cap.formats[0];
 
+        let square_texture = create_square_texture(&device, &queue, surface_format);
+
         let mut state = State {
             instance,
             window,
@@ -47,7 +121,8 @@ impl State {
             size,
             surface,
             surface_format,
-            surface_texture: None
+            surface_texture: None,
+            square_texture
         };
 
         // Configure surface for the first time
@@ -68,7 +143,7 @@ impl State {
         self.surface_texture = None;
 
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: self.surface_format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             // Request compatibility with the sRGB-format texture view we‘re going to create later.
@@ -108,8 +183,9 @@ impl State {
 
         // Renders a GREEN screen
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        // Create the renderpass which will clear the screen.
-        let renderpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+
+        // Clear the screen with an empty render pass.
+        drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &texture_view,
@@ -124,17 +200,40 @@ impl State {
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
-        });
+        }));
 
-        // If you wanted to call any drawing commands, they would go here.
-
-        // End the renderpass.
-        drop(renderpass);
-
-        //encoder.clear_texture(&surface_texture.texture, &wgpu::ImageSubresourceRange);
+        // Draw the test squares with texture copies (no shaders), at fixed offsets from the
+        // top-left corner: a 50x50 square at (SQUARE_POS), and a 20%-of-width x 50 bar at
+        // (BAR_POS). If the OS rescales a stale frame during a resize, they visibly move/stretch.
+        // Both are clamped to the surface size.
+        let (width, height) = (surface_texture.texture.size().width, surface_texture.texture.size().height);
+        let bar_w = (width / 5).min(self.square_texture.width());
+        for (src_y, [dst_x, dst_y], w) in [
+            (0, SQUARE_POS, SQUARE_SIZE),
+            (SQUARE_SIZE, BAR_POS, bar_w),
+        ] {
+            let w = w.min(width.saturating_sub(dst_x));
+            let h = SQUARE_SIZE.min(height.saturating_sub(dst_y));
+            if w == 0 || h == 0 {
+                continue;
+            }
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    origin: wgpu::Origin3d { x: 0, y: src_y, z: 0 },
+                    ..self.square_texture.as_image_copy()
+                },
+                wgpu::TexelCopyTextureInfo {
+                    origin: wgpu::Origin3d { x: dst_x, y: dst_y, z: 0 },
+                    ..surface_texture.texture.as_image_copy()
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+        }
 
         // Submit the command in the queue to execute
-        self.queue.submit([encoder.finish()]);
+        self.queue
+            .submit([encoder.finish()]);
+
         self.window.pre_present_notify();
 
         self.queue.present(surface_texture);
@@ -178,7 +277,7 @@ struct App {
 }
 
 impl ApplicationHandler for App {
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
         let state = self.state.as_mut().unwrap();
         state.render();
         state.update_surface_texture();
